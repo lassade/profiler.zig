@@ -4,20 +4,21 @@ const SourceLocation = std.builtin.SourceLocation;
 const Instant = std.time.Instant;
 const Thread = std.Thread;
 
-const max_frames = 1024;
-const max_threads = 128;
-// const invalid_index = std.math.maxInt(usize);
+pub const enabled = true;
+
+pub const max_frames = 256;
+pub const max_threads = 8;
 
 fn assert(ok: bool) void {
     if (!ok) unreachable; // assertion failure
 }
 
 const Zone = struct {
-    src: SourceLocation,
+    // src: SourceLocation,
     name: [:0]const u8,
     depth: u64,
-    t0: Instant,
-    t1: Instant,
+    t_begin: Instant,
+    t_end: Instant,
 };
 
 const ThreadFrame = struct {
@@ -26,7 +27,8 @@ const ThreadFrame = struct {
 };
 
 const Frame = struct {
-    t0: Instant,
+    t_begin: Instant,
+    t_end: Instant,
     threads: std.MultiArrayList(struct { tid: u64, tf: ThreadFrame }),
 
     fn find(self: *@This(), tid: u64) *ThreadFrame {
@@ -47,20 +49,20 @@ const Frame = struct {
 };
 
 var allocator: Allocator = undefined;
-var t_startup: Instant = undefined;
-var frame_index: u64 = undefined;
-var len: u64 = undefined;
-var frames: [max_frames]Frame = undefined;
+pub var t_startup: Instant = undefined;
+pub var frame_index: u64 = undefined;
+pub var len: u64 = undefined;
+pub var frames: [max_frames]Frame = undefined;
 
 const ZoneScope = struct {
     depth: u64,
     tid: u64,
-    src: SourceLocation,
+    // src: SourceLocation,
     name: [:0]const u8,
-    t0: Instant,
+    t_begin: Instant,
 
     pub fn end(z: @This()) void {
-        const t1 = Instant.now() catch unreachable;
+        const t_end = Instant.now() catch unreachable;
         assert(z.tid == Thread.getCurrentId()); // ended in the same thread it started
         const f = &frames[frame_index];
         const t = f.find(z.tid);
@@ -70,10 +72,10 @@ const ZoneScope = struct {
             allocator,
             Zone{
                 .depth = z.depth,
-                .src = z.src,
+                // .src = z.src,
                 .name = z.name,
-                .t0 = z.t0,
-                .t1 = t1,
+                .t_begin = z.t_begin,
+                .t_end = t_end,
             },
         ) catch unreachable;
     }
@@ -88,7 +90,8 @@ pub fn init(opt: InitOptions) void {
     t_startup = Instant.now() catch unreachable;
 
     const f = &frames[0];
-    f.t0 = t_startup;
+    f.t_begin = t_startup;
+    f.t_end = t_startup;
     f.threads = .{};
     f.threads.ensureTotalCapacity(allocator, max_threads) catch unreachable;
     frame_index = 0;
@@ -105,6 +108,7 @@ pub fn deinit() void {
 }
 
 pub fn frameMark() void {
+    const f0: *Frame = &frames[frame_index];
     frame_index += 1;
     var f1: *Frame = undefined;
     if (len == max_frames) {
@@ -120,10 +124,13 @@ pub fn frameMark() void {
         f1.threads = .{};
         f1.threads.ensureTotalCapacity(allocator, max_threads) catch unreachable;
     }
-    f1.t0 = Instant.now() catch unreachable;
+    const t = Instant.now() catch unreachable;
+    f0.t_end = t;
+    f1.t_begin = t;
+    f1.t_end = t;
 }
 
-pub fn begin(src: SourceLocation, name: [:0]const u8) ZoneScope {
+pub fn begin(_: SourceLocation, name: [:0]const u8) ZoneScope {
     const tid = Thread.getCurrentId();
     const tf = frames[frame_index].find(tid);
     const depth = tf.depth;
@@ -131,9 +138,9 @@ pub fn begin(src: SourceLocation, name: [:0]const u8) ZoneScope {
     return ZoneScope{
         .depth = depth,
         .tid = tid,
-        .src = src,
+        // .src = src,
         .name = name,
-        .t0 = Instant.now() catch unreachable,
+        .t_begin = Instant.now() catch unreachable,
     };
 }
 
@@ -145,15 +152,11 @@ pub fn dump(file_name: []const u8) !void {
 
     var comma = false;
 
-    var depth: u16 = 0;
-    var zone_stack: [256]usize = undefined;
-
     const writer = file.writer();
     try writer.writeAll("[\n");
     for (frames[0..len]) |*f| {
         // todo: add frames scopes
 
-        // todo: not ideal, the events phases must be sorted BBEEBE to get a good trace print on chrome
         for (f.threads.items(.tf), 1..) |*tf, tid| {
             const s = tf.zones.slice();
 
@@ -164,51 +167,21 @@ pub fn dump(file_name: []const u8) !void {
                     return c.t[a].order(c.t[b]) == .lt;
                 }
             };
-            tf.zones.sort(Sort{ .t = s.items(.t0).ptr });
+            tf.zones.sort(Sort{ .t = s.items(.t_begin).ptr });
 
             for (0..s.len) |i| {
-                const zone_depth = s.items(.depth).ptr[i] + 1;
-
-                // pop preivous scope
-                while (zone_depth <= depth) {
-                    depth -= 1;
-                    const j = zone_stack[depth];
-                    try writer.print(
-                        \\,
-                        \\  {{ "name": "{s}", "ph": "E", "pid": 0, "tid": {}, "ts": {} }}
-                    , .{
-                        s.items(.name).ptr[j],
-                        tid,
-                        @as(f64, @floatFromInt(s.items(.t1).ptr[j].since(t_startup))) / 1000.0,
-                    });
-                }
-
-                zone_stack[depth] = i;
-                depth += 1;
-                assert(zone_depth == depth);
+                const t_begin = s.items(.t_begin).ptr[i];
+                const t_end = s.items(.t_end).ptr[i];
 
                 if (comma) try writer.writeAll(",\n");
                 comma = true;
                 try writer.print(
-                    \\  {{ "name": "{s}", "ph": "B", "pid": 0, "tid": {}, "ts": {} }}
+                    \\  {{ "name": "{s}", "ph": "X", "pid": 0, "tid": {}, "ts": {}, "dur": {} }}
                 , .{
                     s.items(.name).ptr[i],
                     tid,
-                    @as(f64, @floatFromInt(s.items(.t0).ptr[i].since(t_startup))) / 1000.0,
-                });
-            }
-
-            // pop last zones
-            while (depth > 0) {
-                depth -= 1;
-                const j = zone_stack[depth];
-                try writer.print(
-                    \\,
-                    \\  {{ "name": "{s}", "ph": "E", "pid": 0, "tid": {}, "ts": {} }}
-                , .{
-                    s.items(.name).ptr[j],
-                    tid,
-                    @as(f64, @floatFromInt(s.items(.t1).ptr[j].since(t_startup))) / 1000.0,
+                    @as(f64, @floatFromInt(t_begin.since(t_startup))) / 1000.0,
+                    @as(f64, @floatFromInt(t_end.since(t_begin))) / 1000.0,
                 });
             }
         }
