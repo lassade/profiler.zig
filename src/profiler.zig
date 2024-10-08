@@ -145,17 +145,20 @@ pub fn begin(_: SourceLocation, name: [:0]const u8) ZoneScope {
 }
 
 pub fn dump(file_name: []const u8) !void {
-    // const t_dump = Instant.now() catch unreachable;
+    const t_dump = try Instant.now();
 
     const file = try std.fs.cwd().createFile(file_name, .{});
     defer file.close();
 
-    var comma = false;
-
     const writer = file.writer();
     try writer.writeAll("[\n");
     for (frames[0..len]) |*f| {
-        // todo: add frames scopes
+        try writer.print(
+            \\  {{ "name": "frame", "ph": "i", "pid": 0, "tid": 1, "ts": {} }},
+            \\
+        , .{
+            @as(f64, @floatFromInt(f.t_begin.since(t_startup))) / 1000.0,
+        });
 
         for (f.threads.items(.tf), 1..) |*tf, tid| {
             const s = tf.zones.slice();
@@ -173,10 +176,9 @@ pub fn dump(file_name: []const u8) !void {
                 const t_begin = s.items(.t_begin).ptr[i];
                 const t_end = s.items(.t_end).ptr[i];
 
-                if (comma) try writer.writeAll(",\n");
-                comma = true;
                 try writer.print(
-                    \\  {{ "name": "{s}", "ph": "X", "pid": 0, "tid": {}, "ts": {}, "dur": {} }}
+                    \\  {{ "name": "{s}", "ph": "X", "pid": 0, "tid": {}, "ts": {}, "dur": {} }},
+                    \\
                 , .{
                     s.items(.name).ptr[i],
                     tid,
@@ -186,7 +188,14 @@ pub fn dump(file_name: []const u8) !void {
             }
         }
     }
-    try writer.writeAll("\n]\n");
+
+    try writer.print(
+        \\  {{ "name": "dump", "ph": "i", "pid": 0, "tid": 1, "ts": {} }}
+        \\]
+        \\
+    , .{
+        @as(f64, @floatFromInt(t_dump.since(t_startup))) / 1000.0,
+    });
 }
 
 test {
