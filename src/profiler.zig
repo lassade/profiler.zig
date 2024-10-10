@@ -163,16 +163,8 @@ pub fn dump(file_name: []const u8) !void {
         for (f.threads.items(.tf), 1..) |*tf, tid| {
             const s = tf.zones.slice();
 
-            // higher depth zones are located first than their enclosed zones
-            const Sort = struct {
-                t: [*]Instant,
-                pub inline fn lessThan(c: @This(), a: usize, b: usize) bool {
-                    return c.t[a].order(c.t[b]) == .lt;
-                }
-            };
-            tf.zones.sort(Sort{ .t = s.items(.t_begin).ptr });
-
-            for (0..s.len) |i| {
+            var i = s.len -% 1;
+            while (i < s.len) : (i -%= 1) {
                 const t_begin = s.items(.t_begin).ptr[i];
                 const t_end = s.items(.t_end).ptr[i];
 
