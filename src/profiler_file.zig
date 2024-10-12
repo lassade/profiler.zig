@@ -1,9 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const File = std.fs.File;
 const SourceLocation = std.builtin.SourceLocation;
-const Instant = std.time.Instant;
+const Timer = std.time.Timer;
 const Thread = std.Thread;
+const Id = Thread.Id;
 
 pub const enabled = true;
 
@@ -16,66 +17,77 @@ fn assert(ok: bool) void {
 const Zone = struct {
     // src: SourceLocation,
     name: [:0]const u8,
-    depth: u64,
-    t_begin: Instant,
-    t_end: Instant,
+    depth: u32,
+    time_begin: u64,
+    time_end: u64,
 };
 
-const ThreadFrame = struct {
-    depth: u16 = 0,
-    zones: std.MultiArrayList(Zone) = .{},
-};
+const ZoneList = std.ArrayListUnmanaged(Zone);
 
 const Frame = struct {
-    // t_begin: Instant,
-    // t_end: Instant,
-    threads: std.MultiArrayList(struct { tid: u64, tf: ThreadFrame }),
-
-    fn find(self: *@This(), tid: u64) *ThreadFrame {
-        const s = self.threads.slice();
-        const tids = s.items(.tid);
-        const tfs = s.items(.tf);
-        return &tfs.ptr[
-            std.mem.indexOfScalar(u64, tids, tid) orelse blk: {
-                assert(self.threads.len < self.threads.capacity);
-                const i = self.threads.len;
-                self.threads.len += 1;
-                tids.ptr[i] = tid;
-                tfs.ptr[i] = .{};
-                break :blk i;
-            }
-        ];
-    }
+    time_begin: u64,
+    time_end: u64,
+    tz: [max_threads]ZoneList,
 };
 
 var allocator: Allocator = undefined;
-pub var t_startup: Instant = undefined;
+pub var time_scale: f64 = undefined;
+pub var time_startup: u64 = undefined;
+pub var timer: Timer = undefined;
 pub var frame_index: u64 = undefined;
+pub var len: u64 = undefined;
 pub var frame: Frame = undefined;
-var file: File = undefined;
-var file_writer: File.Writer = undefined;
+var file: std.fs.File = undefined;
+var dump_buffer: std.ArrayListUnmanaged(u8) = undefined;
+
+const ThreadMeta = struct {
+    id: Id = 0,
+    depth: u32 = 0,
+};
+threadlocal var tmeta: ThreadMeta = .{};
+var tida: std.atomic.Value(Id) = .{ .raw = 1 };
+
+// todo: not quite sure when `rdtsc` is available
+const hwtsc = builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86;
+
+inline fn sample() u64 {
+    // losely based on tracy Profiler::GetTime() TracyProfiler.hpp:190
+    if (hwtsc) {
+        // rdtscp includes the processor id and coobers ecx as well
+        return asm volatile (
+            \\rdtsc
+            \\shlq    $32, %rdx
+            \\orq     %rdx, %rax
+            : [ret] "={rax}" (-> u64),
+            : // inputs
+            : "rax", "rdx" // clobbers
+        );
+    } else {
+        // fallback, not as acurate when dealing with nanosecond scale
+        return timer.read();
+    }
+}
 
 const ZoneScope = struct {
-    depth: u64,
-    tid: u64,
+    tid: Id,
+    depth: u32,
     // src: SourceLocation,
     name: [:0]const u8,
-    t_begin: Instant,
+    time_begin: u64,
 
     pub fn end(z: @This()) void {
-        const t_end = Instant.now() catch unreachable;
-        assert(z.tid == Thread.getCurrentId()); // ended in the same thread it started
-        const t = frame.find(z.tid);
-        assert(z.depth + 1 == t.depth); // sane begin/end
-        t.depth -= 1;
-        t.zones.append(
+        const t_end = sample();
+        assert(z.tid == tmeta.id); // ended in the same thread it started
+        assert(z.depth + 1 == tmeta.depth); // ordered begin/end
+        tmeta.depth -= 1;
+        frame.tz[(z.tid -% 1)].append(
             allocator,
             Zone{
                 .depth = z.depth,
                 // .src = z.src,
                 .name = z.name,
-                .t_begin = z.t_begin,
-                .t_end = t_end,
+                .time_begin = z.time_begin,
+                .time_end = t_end,
             },
         ) catch unreachable;
     }
@@ -86,96 +98,128 @@ const InitOptions = struct {
     file_name: []const u8 = "profile.json",
 };
 
-pub fn init(opt: InitOptions) void {
+pub fn init(opt: InitOptions) !void {
     allocator = opt.allocator;
-    t_startup = Instant.now() catch unreachable;
+    timer = try Timer.start();
+    time_startup = sample();
 
-    // frame.t_begin = t_startup;
-    // frame.t_end = t_startup;
-    frame.threads = .{};
-    frame.threads.ensureTotalCapacity(allocator, max_threads) catch unreachable;
+    file = try std.fs.cwd().createFile(opt.file_name, .{});
+    try file.writeAll("[\n");
+    dump_buffer = .{};
+
+    frame.time_begin = time_startup;
+    frame.time_end = time_startup;
+    @memset(&frame.tz, ZoneList{});
     frame_index = 0;
+    len = 1;
 
-    file = std.fs.cwd().createFile(opt.file_name, .{}) catch unreachable;
-    file_writer = file.writer();
-    file_writer.writeAll(
-        \\[
-        \\  { "name": "init", "ph": "i", "pid": 0, "tid": 1, "ts": 0 },
-        \\
-    ) catch unreachable;
+    calibrate();
+}
+
+/// can take up to 200ms to calibrate
+fn calibrate() void {
+    // copied from tracy Profiler::CalibrateTimer() TracyProfiler.cpp:3519
+    if (hwtsc) {
+        const zone = begin(@src(), "calibrate");
+        defer zone.end();
+
+        @fence(.acq_rel);
+        const t0 = std.time.Instant.now() catch unreachable;
+        const r0 = sample();
+        @fence(.acq_rel);
+        std.time.sleep(std.time.ns_per_ms * 200);
+        @fence(.acq_rel);
+        const t1 = std.time.Instant.now() catch unreachable;
+        const r1 = sample();
+        @fence(.acq_rel);
+
+        const dt = t1.since(t0);
+        const dr = r1 - r0;
+
+        time_scale = @as(f64, @floatFromInt(dt)) / (@as(f64, @floatFromInt(dr)) * 1000.0);
+    } else {
+        time_scale = 1.0 / 1000.0;
+    }
 }
 
 pub fn deinit() void {
-    const t_now = Instant.now() catch unreachable;
-
-    file_writer.print(
-        \\  {{ "name": "deinit", "ph": "i", "pid": 0, "tid": 1, "ts": {} }}
-        \\]
-        \\
-    , .{
-        @as(f64, @floatFromInt(t_now.since(t_startup))) / 1000.0,
-    }) catch unreachable;
+    dump() catch {};
+    file.writeAll("\n]\n") catch {};
     file.close();
 
-    for (frame.threads.items(.tf)) |*tf| tf.zones.deinit(allocator);
-    frame.threads.deinit(allocator);
+    // free memory
+    for (&frame.tz) |*zones| zones.deinit(allocator);
+    dump_buffer.deinit(allocator);
 }
 
 pub fn frameMark() void {
-    frame_index +%= 1;
+    frame.time_end = sample();
 
-    const t_now = Instant.now() catch unreachable;
+    // todo: jobified dump
+    dump() catch {};
 
-    file_writer.print(
-        \\  {{ "name": "frameMark", "ph": "i", "pid": 0, "tid": 1, "ts": {} }},
-        \\
-    , .{
-        @as(f64, @floatFromInt(t_now.since(t_startup))) / 1000.0,
-    }) catch unreachable;
-
-    for (frame.threads.items(.tf), 1..) |*tf, tid| {
-        const s = tf.zones.slice();
-
-        var i = s.len -% 1;
-        while (i < s.len) : (i -%= 1) {
-            const t_begin = s.items(.t_begin).ptr[i];
-            const t_end = s.items(.t_end).ptr[i];
-
-            file_writer.print(
-                \\  {{ "name": "{s}", "ph": "X", "pid": 0, "tid": {}, "ts": {}, "dur": {} }},
-                \\
-            , .{
-                s.items(.name).ptr[i],
-                tid,
-                @as(f64, @floatFromInt(t_begin.since(t_startup))) / 1000.0,
-                @as(f64, @floatFromInt(t_end.since(t_begin))) / 1000.0,
-            }) catch unreachable;
-        }
-
-        // clear zones in all threads but kee
-        tf.zones.len = 0;
-    }
-
-    const t_end = Instant.now() catch unreachable;
-    file_writer.print(
-        \\  {{ "name": "dump", "ph": "X", "pid": 0, "tid": 1, "ts": {}, "dur": {} }},
-        \\
-    , .{
-        @as(f64, @floatFromInt(t_now.since(t_startup))) / 1000.0,
-        @as(f64, @floatFromInt(t_end.since(t_now))) / 1000.0,
-    }) catch unreachable;
+    const time = sample();
+    frame.time_begin = time;
+    frame.time_end = time;
+    for (0..max_threads) |t| frame.tz[t].items.len = 0;
+    frame_index += 1;
 }
 
-pub fn begin(_: SourceLocation, name: [:0]const u8) ZoneScope {
-    const tid = Thread.getCurrentId();
-    const tf = frame.find(tid);
-    const depth = tf.depth;
-    tf.depth += 1;
+pub fn begin(comptime _: SourceLocation, name: [:0]const u8) ZoneScope {
+    if (tmeta.id == 0) tmeta.id = tida.fetchAdd(1, .monotonic);
+    const tid = tmeta.id;
+    const depth = tmeta.depth;
+    tmeta.depth += 1;
     return ZoneScope{
         .depth = depth,
         .tid = tid,
         // .src = src,
         .name = name,
-        .t_begin = Instant.now() catch unreachable,
+        .time_begin = sample(),
     };
+}
+
+fn dump() !void {
+    const time_dump = sample();
+
+    dump_buffer.items.len = 0; // clear buffer
+    const writer = dump_buffer.writer(allocator);
+
+    if (frame_index != 0) try writer.writeAll(",\n");
+
+    try writer.print(
+        \\  {{ "name": "frame", "ph": "X", "pid": 0, "tid": 1, "ts": {}, "dur": {} }},
+        \\
+    , .{
+        @as(f64, @floatFromInt(frame.time_begin - time_startup)) * time_scale,
+        @as(f64, @floatFromInt(frame.time_end - frame.time_begin)) * time_scale,
+    });
+
+    for (&frame.tz, 1..) |zones, tid| {
+        var i = zones.items.len -% 1;
+        while (i < zones.items.len) : (i -%= 1) {
+            const zone = zones.items[i];
+            try writer.print(
+                \\  {{ "name": "{s}", "ph": "X", "pid": 0, "tid": {}, "ts": {}, "dur": {} }},
+                \\
+            , .{
+                zone.name,
+                tid,
+                @as(f64, @floatFromInt(zone.time_begin - time_startup)) * time_scale,
+                @as(f64, @floatFromInt(zone.time_end - zone.time_begin)) * time_scale,
+            });
+        }
+    }
+
+    // write and fush the buffer contents in here ti the get a more acurate time mesure of this operation
+    try file.writeAll(dump_buffer.items);
+    try file.sync();
+
+    const t_end = sample();
+    try file.writer().print(
+        \\  {{ "name": "dump", "ph": "X", "pid": 0, "tid": 1, "ts": {}, "dur": {} }}
+    , .{
+        @as(f64, @floatFromInt(time_dump - time_startup)) * time_scale,
+        @as(f64, @floatFromInt(t_end - time_dump)) * time_scale,
+    });
 }
